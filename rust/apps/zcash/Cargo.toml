@@ -20,6 +20,8 @@ zcash_note_encryption = "0.4.1"
 
 [dev-dependencies]
 keystore = { path = "../../keystore" }
+halo2_poseidon = "0.1"
+ff = { version = "0.13", default-features = false }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

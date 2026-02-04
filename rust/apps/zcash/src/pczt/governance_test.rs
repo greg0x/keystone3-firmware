@@ -18,19 +18,19 @@
 mod governance_nullifier_tests {
     use super::super::*;
     use alloc::vec::Vec;
-    use blake2b_simd::Params;
+    use blake2b_simd::Params as Blake2bParams;
+    use ff::PrimeField;
+    use halo2_poseidon::{ConstantLength, Hash, P128Pow5T3};
     use keystore::algorithms::zcash::{calculate_seed_fingerprint, derive_ufvk};
     use zcash_vendor::{
+        pasta_curves::pallas,
         pczt::Pczt,
         zcash_protocol::consensus::MainNetwork,
     };
 
-    // Domain separator for governance nullifiers (16 bytes for Blake2b personalization)
-    const GOV_NULLIFIER_PERSONALIZATION: &[u8; 16] = b"ZcashGovNullifi_";
-
     // Pallas base field modulus (q) - nullifier must be less than this
     // q = 0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001
-    // For simplicity, we'll use a mask to ensure validity
+    // For simplicity, we'll use a mask to ensure validity when converting bytes to field element
     const PALLAS_MODULUS_HIGH_BYTE_MASK: u8 = 0x3F; // Ensures high byte < 0x40
 
     // Test data: A valid PCZT with Orchard actions and matching seed
@@ -38,55 +38,63 @@ mod governance_nullifier_tests {
 
     const MATCHING_SEED_HEX: &str = "d561f5aba9db8b100a9a84197322e522f952171a388ad74eaab1ab9db815be3335c3099a0a2bb0fee57e630db5ed7251412b6bd4b905cf518627411fee3f32dd";
 
-    /// Derives a governance nullifier using the proposed scheme.
+    /// Converts a 32-byte array to a Pallas base field element.
+    ///
+    /// Masks the high byte to ensure the value is less than the field modulus.
+    /// This is a simplified approach; production code should use proper modular reduction.
+    fn bytes_to_pallas_base(bytes: &[u8; 32]) -> pallas::Base {
+        let mut masked = *bytes;
+        // Pallas uses little-endian, so byte[31] is the most significant byte.
+        masked[31] &= PALLAS_MODULUS_HIGH_BYTE_MASK;
+        pallas::Base::from_repr(masked).expect("masked bytes should be valid field element")
+    }
+
+    /// Hashes a proposal ID to a Pallas field element using Blake2b.
+    ///
+    /// This allows variable-length proposal IDs to be used in Poseidon hash.
+    fn hash_proposal_id(proposal_id: &[u8]) -> pallas::Base {
+        let hash = Blake2bParams::new()
+            .hash_length(32)
+            .personal(b"ZcashGovProposal")
+            .hash(proposal_id);
+        let bytes: [u8; 32] = hash.as_bytes().try_into().expect("Blake2b output is 32 bytes");
+        bytes_to_pallas_base(&bytes)
+    }
+
+    /// Derives a governance nullifier using the proposed Poseidon-based scheme.
     ///
     /// Standard Orchard nullifier: Poseidon(nk, rho, psi, cm)
-    /// Governance nullifier: Blake2b("ZcashGovNullifi_" || proposal_id || voting_share_index || nk || rho)
+    /// Governance nullifier: Poseidon(H(proposal_id), voting_share_index, nk, rho)
+    ///
+    /// Per the proposal: "The UI derives governance nullifiers by changing the Poseidon hash
+    /// from H(nullifier_key || rho) to instead effectively be
+    /// H("gov_proposal_1" || voting_share_3 || nullifier_key || rho)."
     ///
     /// The governance nullifier is intentionally different from the mainnet derivation
     /// so that:
     /// 1. It cannot be used to spend funds on mainnet
     /// 2. It uniquely identifies a vote for a specific (proposal, voting_share, note)
     /// 3. It can be verified in an off-chain ZKP
-    ///
-    /// NOTE: The nullifier must be a valid Pallas base field element (< modulus).
-    /// We ensure this by masking the high byte. In production, use proper modular reduction.
     fn derive_governance_nullifier(
         proposal_id: &[u8],
         voting_share_index: u8,
         nk: &[u8; 32],  // nullifier deriving key
         rho: &[u8; 32], // note randomness (rho from the note)
     ) -> [u8; 32] {
-        // Use Blake2b with a unique personalization for governance nullifiers
-        // This ensures domain separation from mainnet Orchard nullifiers
-        let mut hasher = Params::new()
-            .hash_length(32)
-            .personal(GOV_NULLIFIER_PERSONALIZATION)
-            .to_state();
+        // Convert inputs to Pallas field elements
+        let proposal_element = hash_proposal_id(proposal_id);
+        let voting_share_element = pallas::Base::from(voting_share_index as u64);
+        let nk_element = bytes_to_pallas_base(nk);
+        let rho_element = bytes_to_pallas_base(rho);
 
-        // Hash: proposal_id || voting_share_index || nk || rho
-        // This ensures uniqueness across:
-        // - Different proposals (proposal_id)
-        // - Different vote chunks for same holder (voting_share_index)
-        // - Different notes (nk, rho)
-        hasher.update(proposal_id);
-        hasher.update(&[voting_share_index]);
-        hasher.update(nk);
-        hasher.update(rho);
+        // Use Poseidon hash with 4 inputs
+        // P128Pow5T3 has width 3 and rate 2, so we use ConstantLength<4>
+        // which will absorb inputs in 2 rounds (2 elements per round)
+        let nullifier: pallas::Base = Hash::<_, P128Pow5T3, ConstantLength<4>, 3, 2>::init()
+            .hash([proposal_element, voting_share_element, nk_element, rho_element]);
 
-        let mut result: [u8; 32] = hasher
-            .finalize()
-            .as_bytes()
-            .try_into()
-            .expect("Blake2b output is 32 bytes");
-
-        // Ensure the result is a valid Pallas base field element.
-        // The Pallas modulus is ~2^254, so we mask the top byte to ensure validity.
-        // This is a simplified approach; production code should use proper modular reduction.
-        // Note: Pallas uses little-endian, so byte[31] is the most significant byte.
-        result[31] &= PALLAS_MODULUS_HIGH_BYTE_MASK;
-
-        result
+        // Convert field element back to bytes
+        nullifier.to_repr()
     }
 
     /// Decomposes a ZEC amount into voting shares based on binary representation.
