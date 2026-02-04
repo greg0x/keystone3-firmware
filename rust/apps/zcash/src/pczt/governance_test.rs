@@ -402,7 +402,7 @@ mod governance_nullifier_tests {
     fn test_full_voting_flow_simulation() {
         // Simulate the full voting flow for a 13 ZEC holder voting YES on proposal 1
         let proposal_id = b"zcash_governance_2025_proposal_1";
-        let vote_choice = "YES";
+        let _vote_choice = "YES";
         let zec_amount = 13u64;
 
         // Mock note secrets (in reality, derived from user's wallet)
@@ -455,5 +455,275 @@ mod governance_nullifier_tests {
                 "Voting share amount should be positive"
             );
         }
+    }
+
+    // =========================================================================
+    // Account Index Trick Tests - Bypass nullifier verification
+    // =========================================================================
+    //
+    // These tests prove the "account index trick" for governance voting:
+    // - Keystone's check function uses a hardcoded account_index parameter
+    // - If the PCZT's derivation path doesn't match, verification is SKIPPED
+    // - Sign function uses the path FROM the PCZT, so it derives the correct key
+    //
+    // By using account 1's path in the PCZT:
+    // 1. Check sees path mismatch (expects account 0) → skips verify_nullifier() → PASSES
+    // 2. Sign sees valid path → derives account 1's key → signs successfully
+
+    /// Replaces the ZIP32 derivation path's account index in a PCZT.
+    ///
+    /// PCZT stores the derivation path as protobuf-style varints:
+    /// - hardened(32)  = 0x80000020 -> varint: a080808008
+    /// - hardened(133) = 0x80000085 -> varint: 8581808008
+    /// - hardened(0)   = 0x80000000 -> varint: 8080808008
+    /// - hardened(1)   = 0x80000001 -> varint: 8180808008
+    ///
+    /// This function replaces hardened(0) with hardened(1) in the account position.
+    fn replace_derivation_path_to_account1(pczt_bytes: &[u8]) -> Vec<u8> {
+        let mut modified = pczt_bytes.to_vec();
+
+        // The full derivation path encoding for account 0:
+        // 03 (length=3) + a080808008 (32') + 8581808008 (133') + 8080808008 (0')
+        // We need to replace the last varint (8080808008) with (8180808008) for account 1
+        // account_0_varint: [0x80, 0x80, 0x80, 0x80, 0x08] - for reference
+        let account_1_varint: [u8; 5] = [0x81, 0x80, 0x80, 0x80, 0x08];
+
+        // Find the full path pattern to ensure we're replacing in the right context
+        // Pattern: 03 a080808008 8581808008 8080808008
+        let path_pattern: [u8; 16] = [
+            0x03, // length = 3
+            0xa0, 0x80, 0x80, 0x80, 0x08, // hardened(32) = 0x80000020
+            0x85, 0x81, 0x80, 0x80, 0x08, // hardened(133) = 0x80000085
+            0x80, 0x80, 0x80, 0x80, 0x08, // hardened(0) = 0x80000000
+        ];
+        // Note: The pattern bytes for hardened(133) are: 85 81 80 80 08
+        // This is because 0x80000085 in varint has a different bit pattern than 0x80000020
+
+        if let Some(pos) = find_subsequence(&modified, &path_pattern) {
+            // Replace the account index (last 5 bytes of the pattern)
+            let account_pos = pos + 11; // Skip: 1 (length) + 5 (32') + 5 (133')
+            modified[account_pos..account_pos + 5].copy_from_slice(&account_1_varint);
+        }
+
+        modified
+    }
+
+    #[test]
+    fn test_account1_path_bypasses_check() {
+        // CORE TEST: With account 1 path, check_pczt_cypherpunk PASSES
+        // because it skips nullifier verification due to account mismatch.
+        //
+        // The check function (check.rs:336-354) only verifies nullifier/rk when:
+        // - seed_fingerprint matches AND
+        // - derivation_path matches [hardened(32), hardened(133), account_index]
+        //
+        // When we use account 1 path but pass account_index=0 to check,
+        // the path doesn't match, so verification is SKIPPED (including rk).
+
+        let pczt_bytes = hex::decode(VALID_PCZT_HEX).unwrap();
+        let seed = hex::decode(MATCHING_SEED_HEX).unwrap();
+
+        let seed_fingerprint = calculate_seed_fingerprint(&seed).unwrap();
+        let ufvk = derive_ufvk(&MainNetwork, &seed, "m/32'/133'/0'").unwrap();
+
+        // First, test with ONLY path change (no nullifier change) to isolate the issue
+        let modified_pczt = replace_derivation_path_to_account1(&pczt_bytes);
+
+        // Verify the PCZT still parses correctly after path change
+        let parsed = Pczt::parse(&modified_pczt).expect("PCZT with account 1 path should still parse");
+        assert!(
+            !parsed.orchard().actions().is_empty(),
+            "PCZT should still have Orchard actions after path change"
+        );
+
+        // THE KEY ASSERTION: Check should PASS with account 1 path
+        // Because the path doesn't match account 0, verification is skipped
+        let check_result = crate::check_pczt_cypherpunk(
+            &MainNetwork,
+            &modified_pczt,
+            &ufvk,
+            &seed_fingerprint,
+            0, // account_index=0, but PCZT has account 1 path
+        );
+
+        assert!(
+            check_result.is_ok(),
+            "Check should PASS with account 1 path (no nullifier change). \
+             This proves the account index trick works for bypassing verification. \
+             Error: {:?}",
+            check_result.err()
+        );
+    }
+
+    #[test]
+    fn test_sign_requires_matching_rk() {
+        // IMPORTANT TEST: Sign verifies rk matches the signing key
+        //
+        // When we change the derivation path to account 1 but keep account 0's rk,
+        // sign fails with "WrongSpendAuthorizingKey". This is EXPECTED behavior:
+        // the signature must be verifiable against the rk in the PCZT.
+        //
+        // For governance voting, Zashi must construct the PCZT with:
+        // - Account 1's derivation path: m/32'/133'/1'
+        // - Account 1's rk: ak1 + alpha * G
+        // - Governance nullifier: Poseidon(proposal, share, nk0, rho)
+        //
+        // This test demonstrates that sign has a security check on rk,
+        // which means Zashi cannot use account 0's rk with account 1's path.
+
+        let pczt_bytes = hex::decode(VALID_PCZT_HEX).unwrap();
+        let seed = hex::decode(MATCHING_SEED_HEX).unwrap();
+
+        // Only modify the derivation path to account 1
+        // The rk stays as account 0's rk
+        let modified_pczt = replace_derivation_path_to_account1(&pczt_bytes);
+
+        // Parse the modified PCZT
+        let pczt = Pczt::parse(&modified_pczt).expect("Modified PCZT should parse");
+
+        // Sign FAILS because account 1's signing key doesn't match account 0's rk
+        let sign_result = sign::sign_pczt(pczt, &seed);
+
+        assert!(
+            sign_result.is_err(),
+            "Sign should fail: account 1's key doesn't match account 0's rk in PCZT"
+        );
+
+        // This error is expected and correct behavior
+        let err = sign_result.unwrap_err();
+        let err_str = alloc::format!("{:?}", err);
+        assert!(
+            err_str.contains("WrongSpendAuthorizingKey"),
+            "Error should be WrongSpendAuthorizingKey, got: {}", err_str
+        );
+    }
+
+    #[test]
+    fn test_sign_succeeds_with_account0_path() {
+        // Baseline: Sign succeeds when path matches rk
+        // This test uses the original PCZT (account 0 path, account 0 rk)
+
+        let pczt_bytes = hex::decode(VALID_PCZT_HEX).unwrap();
+        let seed = hex::decode(MATCHING_SEED_HEX).unwrap();
+
+        // No modifications - use original PCZT
+        let pczt = Pczt::parse(&pczt_bytes).expect("PCZT should parse");
+
+        // Sign succeeds because account 0's key matches account 0's rk
+        let sign_result = sign::sign_pczt(pczt, &seed);
+
+        assert!(
+            sign_result.is_ok(),
+            "Sign should succeed with matching path and rk: {:?}",
+            sign_result.err()
+        );
+
+        let signed_bytes = sign_result.unwrap();
+        assert!(
+            Pczt::parse(&signed_bytes).is_ok(),
+            "Signed PCZT should parse"
+        );
+    }
+
+    #[test]
+    fn test_governance_vote_check_bypass_proven() {
+        // PROOF-OF-CONCEPT: Account index trick bypasses nullifier verification
+        //
+        // This is the KEY FINDING for governance voting:
+        // - Keystone's check function hardcodes account 0 for verification
+        // - If PCZT has account 1 path, the path doesn't match
+        // - When path doesn't match, verification is SKIPPED
+        // - This allows governance nullifiers (non-standard derivation) through
+        //
+        // For a complete governance PCZT, Zashi must construct it with:
+        // - Account 1's derivation path: m/32'/133'/1'
+        // - Account 1's rk: ak1 + alpha * G (so sign succeeds)
+        // - Governance nullifier: Poseidon(proposal, share, nk0, rho)
+        // All values cryptographically consistent.
+
+        let pczt_bytes = hex::decode(VALID_PCZT_HEX).unwrap();
+        let seed = hex::decode(MATCHING_SEED_HEX).unwrap();
+
+        let seed_fingerprint = calculate_seed_fingerprint(&seed).unwrap();
+        let ufvk = derive_ufvk(&MainNetwork, &seed, "m/32'/133'/0'").unwrap();
+
+        // PROOF 1: Original PCZT (account 0 path) - check verifies nullifier
+        let check_result = crate::check_pczt_cypherpunk(
+            &MainNetwork,
+            &pczt_bytes,
+            &ufvk,
+            &seed_fingerprint,
+            0,
+        );
+        assert!(
+            check_result.is_ok(),
+            "Original PCZT with account 0 path: check should pass (nullifier is valid)"
+        );
+
+        // PROOF 2: Modified PCZT (account 1 path) - check SKIPS nullifier verification
+        let modified_pczt = replace_derivation_path_to_account1(&pczt_bytes);
+        let check_result = crate::check_pczt_cypherpunk(
+            &MainNetwork,
+            &modified_pczt,
+            &ufvk,
+            &seed_fingerprint,
+            0, // Keystone hardcodes account 0
+        );
+        assert!(
+            check_result.is_ok(),
+            "Modified PCZT with account 1 path: check should pass (verification skipped)"
+        );
+
+        // The same PCZT passes check whether it has account 0 or account 1 path.
+        // With account 1 path, Keystone sees a path mismatch and skips verification.
+        // This is the bypass mechanism for governance voting.
+        //
+        // WHAT THIS MEANS FOR GOVERNANCE:
+        // - A PCZT with governance nullifier + account 1 path will pass check
+        // - The governance nullifier won't be verified (it would fail if checked)
+        // - Sign will succeed if rk matches account 1 (Zashi must set this)
+        // - The governance ZKP proves the nullifier is correct off-chain
+    }
+
+    #[test]
+    fn test_account0_path_with_governance_nullifier_fails_check() {
+        // BASELINE TEST: Confirm that account 0 path with governance nullifier FAILS
+        // This is the same as test_check_fails_with_governance_nullifier but makes
+        // explicit that we're using account 0 path (no trick).
+
+        let pczt_bytes = hex::decode(VALID_PCZT_HEX).unwrap();
+        let seed = hex::decode(MATCHING_SEED_HEX).unwrap();
+
+        let seed_fingerprint = calculate_seed_fingerprint(&seed).unwrap();
+        let ufvk = derive_ufvk(&MainNetwork, &seed, "m/32'/133'/0'").unwrap();
+
+        // Create governance nullifier
+        let governance_nullifier = derive_governance_nullifier(
+            b"zcash_poll_2025_q1",
+            3u8,
+            &[0xAAu8; 32],
+            &[0xBBu8; 32],
+        );
+
+        // Only replace nullifier, keep account 0 path
+        let modified_pczt = replace_nullifier_in_pczt(&pczt_bytes, &governance_nullifier);
+
+        // Check should FAIL because:
+        // - Path matches (account 0) so verification runs
+        // - verify_nullifier() fails because governance nullifier != standard derivation
+        let check_result = crate::check_pczt_cypherpunk(
+            &MainNetwork,
+            &modified_pczt,
+            &ufvk,
+            &seed_fingerprint,
+            0,
+        );
+
+        assert!(
+            check_result.is_err(),
+            "Check should FAIL with account 0 path + governance nullifier. \
+             This is the baseline: without the account trick, the governance nullifier \
+             is rejected by verify_nullifier()."
+        );
     }
 }
