@@ -469,6 +469,8 @@ dependencies = [
  "bitcoin",
  "bitvec",
  "blake2b_simd",
+ "ff",
+ "halo2_poseidon",
  "hex",
  "keystore",
  "rand_core 0.6.4",

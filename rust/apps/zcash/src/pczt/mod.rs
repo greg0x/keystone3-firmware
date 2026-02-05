@@ -16,3 +16,6 @@ pub mod check;
 pub mod parse;
 pub mod sign;
 pub mod structs;
+
+#[cfg(test)]
+mod governance_test;
