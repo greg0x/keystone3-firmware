@@ -611,7 +611,7 @@ static bool on_qr_detected(const char *qrString)
 
 int32_t read_qrcode()
 {
-    read_qr_code_from_screen(on_qr_detected, 64);
+    read_qr_code_from_screen(on_qr_detected, 20);  // Note: Run from Terminal.app, not Ghostty
     return 0;
 }
 #else

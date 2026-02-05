@@ -19,22 +19,27 @@ Its standout features include:
 Follow these steps to set up your development environment on MacOS:
 
 ```bash
-# Install GCC
-brew install armmbed/formulae/arm-none-eabi-gcc
-# If you encounter issues with Brew when installing GCC, switch to manual installation:
-# Visit https://developer.arm.com/downloads/-/gnu-rm, and select the `9-2020-q2-update`
+# Install ARM GCC toolchain
+brew install --cask gcc-arm-embedded
 
-# Install Rust
-# For instructions, visit https://www.rust-lang.org/tools/install
+# Install Rust (https://www.rust-lang.org/tools/install)
 rustup install nightly-2025-05-01
 rustup target add thumbv7em-none-eabihf
 cargo install bindgen-cli
-cargo install cbindgen
+rustup run stable cargo install cbindgen  # Use stable Rust for cbindgen
 
 # Clone the repository
 git clone https://github.com/KeystoneHQ/keystone3-firmware
 cd keystone3-firmware
 git -c submodule.keystone3-firmware-release.update=none submodule update --init --recursive
+```
+
+##### GCC 15 Compatibility Fix
+
+The current ARM GCC (15.x) is stricter than the GCC 9 originally used. To build successfully, edit `firmware.cmake` line 12 to add relaxed warning flags:
+
+```cmake
+set(CMAKE_C_FLAGS "${MCU_FLAGS} -Wall -Wno-unknown-pragmas -Wno-format -g -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=discarded-qualifiers -Wno-error=int-conversion")
 ```
 
 #### Docker
@@ -49,18 +54,22 @@ docker build -t keystone3-baker:local .
 
 Here's how to build the Keystone3 Firmware:
 
-#### Building multi-coins firmware
+#### Building multi-coins firmware (default)
 
 ```bash
-# Run the build script at the root of the project.
 python3 build.py
+```
+
+#### Building cypherpunk firmware (Zcash shielded support)
+
+```bash
+python3 build.py -t cypherpunk
 ```
 
 #### Building btc-only firmware
 
 ```bash
-# Run the build script at the root of the project.
-python build.py -t btc_only
+python3 build.py -t btc_only
 ```
 
 #### Building img to C file
@@ -104,7 +113,42 @@ The Keystone3 firmware is built with Rust and C and uses FreeRTOS as the underly
 
 ## Simulator
 
-Please follow this [Doc](docs/SIMULATOR.md).
+For full details, see [docs/SIMULATOR.md](docs/SIMULATOR.md).
+
+### Quick Start (macOS)
+
+```bash
+# Install SDL2
+brew install sdl2
+
+# Create Python virtual environment (Python 3.12 recommended, 3.14 has compatibility issues)
+uv venv --python python3.12
+source .venv/bin/activate
+uv pip install -r requirements.txt
+
+# Build and run the simulator (from Terminal.app for QR scanning)
+./simulator.sh
+
+# Run without rebuilding
+./simulator.sh --no-build
+```
+
+### QR Code Scanning (macOS)
+
+The simulator scans QR codes directly from your screen (not camera).
+
+**Setup (one-time):**
+1. Grant **Terminal.app** screen recording permission:
+   - System Settings → Privacy & Security → Screen Recording → Enable Terminal
+
+**Usage:**
+- Run `./simulator.sh` from any terminal - it auto-opens in Terminal.app
+- Display a QR code anywhere on screen
+- Click "Scan" in the simulator - it captures and decodes from screen
+
+**Scanning from mobile device:**
+- AirPlay/mirror your phone to your Mac
+- The simulator will scan the QR from the mirrored screen
 
 ## Contributing
 
