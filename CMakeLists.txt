@@ -385,6 +385,7 @@ else()
 
     if(CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
         # add framework for MacOS simulator to scan QR code
+        target_compile_definitions(${PROJECT_NAME} PRIVATE GET_QR_DATA_FROM_SCREEN)
         target_link_libraries(${PROJECT_NAME} PRIVATE "-framework CoreFoundation")
         target_link_libraries(${PROJECT_NAME} PRIVATE "-framework CoreGraphics")
         
